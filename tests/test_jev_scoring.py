@@ -71,7 +71,6 @@ class _FakeHttpClient:
 def score_route(monkeypatch):
     refunds = []
     consumes = []
-    dispatched = []
 
     async def get_uid(authorization):
         assert authorization == "Bearer token"
@@ -85,16 +84,10 @@ def score_route(monkeypatch):
     async def refund(uid, amount, reason):
         refunds.append((uid, amount, reason))
 
-    def dispatch(uid, body, llm_content, served_by):
-        dispatched.append((uid, served_by))
-
     monkeypatch.setattr(main, "get_uid", get_uid)
     monkeypatch.setattr(main, "consume_credits", consume_credits)
     monkeypatch.setattr(main, "_refund", refund)
-    monkeypatch.setattr(main, "_dispatch_score_shadow", dispatch)
-    monkeypatch.setattr(main, "JEV_SCORE_PERCENT", 0)
-    monkeypatch.setattr(main, "JEV_SCORE_SHADOW_ENABLED", False)
-    return {"refunds": refunds, "consumes": consumes, "dispatched": dispatched}
+    return {"refunds": refunds, "consumes": consumes}
 
 
 def _request():
@@ -103,13 +96,6 @@ def _request():
         actual_answer="Plants convert sunlight to glucose.",
         user_answer="Plants make food from sunlight.",
     )
-
-
-def _llm_ok(monkeypatch):
-    content = json.dumps({"score": 80, "note": "x"})
-    client = _FakeHttpClient([_completion(content)])
-    monkeypatch.setattr(main, "_http_client", client)
-    return client
 
 
 def test_weighted_math_and_accuracy_gate():
@@ -121,20 +107,10 @@ def test_weighted_math_and_accuracy_gate():
     assert main._jev_weighted_score(levels) <= 25
 
 
-def test_bucketing_is_deterministic_and_bounded(monkeypatch):
-    monkeypatch.setattr(main, "JEV_SCORE_PERCENT", 0)
-    assert main._jev_enabled_for("any-user") is False
-    assert main._jev_enabled_for("any-user") is False
-    monkeypatch.setattr(main, "JEV_SCORE_PERCENT", 100)
-    assert main._jev_enabled_for("any-user") is True
-    assert 0 <= main._jev_bucket("any-user") < 100
-
-
 def test_jev_served_shape_has_no_note(monkeypatch, score_route):
     levels = {n: 3 for n in DIM_NAMES}
     client = _FakeHttpClient([_decisions_response(levels)])
     monkeypatch.setattr(main, "_http_client", client)
-    monkeypatch.setattr(main, "JEV_SCORE_PERCENT", 100)
 
     response = asyncio.run(
         main.score_answer(_request(), authorization="Bearer token")
@@ -150,7 +126,6 @@ def test_jev_served_shape_has_no_note(monkeypatch, score_route):
     ]
     assert score_route["consumes"] == [main.ENDPOINT_COSTS["score"]]
     assert score_route["refunds"] == []
-    assert score_route["dispatched"] == []
 
 
 def test_low_confidence_falls_back_to_llm(monkeypatch, score_route):
@@ -161,7 +136,6 @@ def test_low_confidence_falls_back_to_llm(monkeypatch, score_route):
         [_decisions_response(levels, low), _completion(llm_content)]
     )
     monkeypatch.setattr(main, "_http_client", client)
-    monkeypatch.setattr(main, "JEV_SCORE_PERCENT", 100)
 
     response = asyncio.run(
         main.score_answer(_request(), authorization="Bearer token")
@@ -183,7 +157,6 @@ def test_jev_transport_error_falls_back(monkeypatch, score_route):
         [httpx.ConnectError("down"), _completion(llm_content)]
     )
     monkeypatch.setattr(main, "_http_client", client)
-    monkeypatch.setattr(main, "JEV_SCORE_PERCENT", 100)
 
     response = asyncio.run(
         main.score_answer(_request(), authorization="Bearer token")
@@ -191,54 +164,6 @@ def test_jev_transport_error_falls_back(monkeypatch, score_route):
 
     assert json.loads(response["choices"][0]["message"]["content"])["score"] == 60
     assert score_route["refunds"] == []
-
-
-def test_shadow_dispatched_on_llm_path(monkeypatch, score_route):
-    client = _llm_ok(monkeypatch)
-    monkeypatch.setattr(main, "JEV_SCORE_SHADOW_ENABLED", True)
-
-    asyncio.run(main.score_answer(_request(), authorization="Bearer token"))
-
-    assert len(client.calls) == 1
-    assert score_route["dispatched"] == [("firebase-user", "llm")]
-
-
-def test_shadow_compare_records_agreement(monkeypatch):
-    records = []
-
-    async def fake_record(record):
-        records.append(record)
-
-    async def fake_jev(question, reference_answer, student_answer):
-        return {"levels": {}, "weighted": 72, "minconf": 0.8,
-                "low_dims": 0, "genuine": 0.99, "model": "m"}
-
-    monkeypatch.setattr(main, "_record_score_shadow", fake_record)
-    monkeypatch.setattr(main, "score_with_jev", fake_jev)
-
-    asyncio.run(
-        main._shadow_compare_and_record(
-            "firebase-user", "q", "ref", "stu",
-            json.dumps({"score": 80}), "llm",
-        )
-    )
-
-    assert len(records) == 1
-    record = records[0]
-    assert record["uid"] == "firebase-user"
-    assert record["llm_score"] == 80
-    assert record["jev_weighted"] == 72
-    assert record["agreed"] is True
-    assert record["served_by"] == "llm"
-    assert record["delete_after_at"] > record["created_at"]
-
-
-def test_shadow_record_builder_handles_missing_llm():
-    record = main._build_shadow_record(
-        "u", "q", "r", "s", None, None, "llm", 123,
-    )
-    assert record["agreed"] is False
-    assert record["jev_weighted"] is None
 
 
 def test_llm_failure_still_refunds_base(monkeypatch, score_route):

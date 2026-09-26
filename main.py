@@ -16,7 +16,6 @@ import secrets
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from hashlib import sha256
 from typing import Annotated, Optional, Union, List
 
 import httpx
@@ -1888,16 +1887,6 @@ JEV_SCORE_MODEL = os.getenv("JEV_SCORE_MODEL", "typesafe/jev-1.13")
 JEV_SCORE_TIMEOUT_SECONDS = 8.0
 JEV_SCORE_MIN_CONFIDENCE = 0.5
 JEV_SCORE_MIN_LOW_DIMS = 2
-JEV_SCORE_SHADOW_TTL_SECONDS = 30 * 24 * 60 * 60
-
-try:
-    JEV_SCORE_PERCENT = int(os.getenv("JEV_SCORE_PERCENT", "0"))
-except (TypeError, ValueError):
-    JEV_SCORE_PERCENT = 0
-JEV_SCORE_PERCENT = max(0, min(100, JEV_SCORE_PERCENT))
-JEV_SCORE_SHADOW_ENABLED = (
-    os.getenv("JEV_SCORE_SHADOW_ENABLED", "false").lower() == "true"
-)
 
 JEV_SCORE_LEVELS = [
     "Wrong or missing",
@@ -1941,15 +1930,6 @@ def _jev_score_questions() -> dict:
         "criteria": JEV_SCORE_GENUINE_CRITERIA,
     }
     return questions
-
-
-def _jev_bucket(uid: str) -> int:
-    digest = sha256(f"jev-score:{uid}".encode("utf-8")).hexdigest()
-    return int(digest[:8], 16) % 100
-
-
-def _jev_enabled_for(uid: str) -> bool:
-    return _jev_bucket(uid) < JEV_SCORE_PERCENT
 
 
 def _jev_weighted_score(levels: dict) -> int:
@@ -2099,100 +2079,6 @@ def _build_score_shadow_record(
     }
 
 
-def _build_shadow_record(
-    uid: str,
-    question: str,
-    reference_answer: str,
-    student_answer: str,
-    llm_score: int | None,
-    jev: dict | None,
-    served_by: str,
-    now: int,
-) -> dict:
-    return {
-        "uid": uid,
-        "question": question,
-        "reference_answer": reference_answer,
-        "student_answer": student_answer,
-        "llm_score": llm_score,
-        "jev_weighted": (jev or {}).get("weighted"),
-        "jev_minconf": (jev or {}).get("minconf"),
-        "jev_genuine": (jev or {}).get("genuine"),
-        "jev_model": (jev or {}).get("model"),
-        "served_by": served_by,
-        "agreed": (
-            llm_score is not None
-            and jev is not None
-            and abs(llm_score - jev["weighted"]) <= 10
-        ),
-        "created_at": now,
-        # Firestore TTL policy on delete_after_at retains 30 days for tuning.
-        "delete_after_at": now + JEV_SCORE_SHADOW_TTL_SECONDS,
-    }
-
-
-def _record_score_shadow_sync(record: dict) -> None:
-    db = fb_fs.client()
-    db.collection("ai_score_shadow").add(record)
-
-
-async def _record_score_shadow(record: dict) -> None:
-    try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(_executor, _record_score_shadow_sync, record)
-    except Exception:
-        logger.exception("score shadow write failed")
-
-
-async def _shadow_compare_and_record(
-    uid: str,
-    question: str,
-    reference_answer: str,
-    student_answer: str,
-    llm_content: str | None,
-    served_by: str,
-) -> None:
-    try:
-        jev = await asyncio.wait_for(
-            score_with_jev(question, reference_answer, student_answer),
-            timeout=JEV_SCORE_TIMEOUT_SECONDS + 5.0,
-        )
-    except Exception:
-        jev = None
-    llm_score = None
-    try:
-        if llm_content is not None:
-            llm_score = int(json.loads(llm_content).get("score"))
-    except (ValueError, TypeError, AttributeError):
-        llm_score = None
-    now = int(datetime.now(timezone.utc).timestamp())
-    await _record_score_shadow(
-        _build_shadow_record(
-            uid, question, reference_answer, student_answer,
-            llm_score, jev, served_by, now,
-        )
-    )
-
-
-def _dispatch_score_shadow(
-    uid: str,
-    body: ScoreRequest,
-    llm_content: str | None,
-    served_by: str,
-) -> None:
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        logger.warning("score shadow skipped: no running loop")
-        return
-    loop.create_task(
-        _shadow_compare_and_record(
-            uid, body.question, body.actual_answer, body.user_answer,
-            llm_content, served_by,
-        )
-    )
-
-
 @app.post("/v1/score")
 async def score_answer(
     body: ScoreRequest,
@@ -2202,26 +2088,23 @@ async def score_answer(
     cost    = ENDPOINT_COSTS["score"]
     credits = await consume_credits(uid, cost)   # 402 if not enough
 
-    if _jev_enabled_for(uid):
-        try:
-            jev = await asyncio.wait_for(
-                score_with_jev(
-                    body.question, body.actual_answer, body.user_answer
-                ),
-                timeout=JEV_SCORE_TIMEOUT_SECONDS + 1.0,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            jev = None
-            logger.exception("score jev failed uid=%s", uid)
-        if jev is not None:
-            content = _jev_score_content(jev)
-            logger.info(
-                "score jev ok uid=%s remaining=%d", uid, credits["remaining"]
-            )
-            return ok_response(content, credits)
-        logger.info("score jev fallback to llm uid=%s", uid)
+    try:
+        jev = await asyncio.wait_for(
+            score_with_jev(body.question, body.actual_answer, body.user_answer),
+            timeout=JEV_SCORE_TIMEOUT_SECONDS + 1.0,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        jev = None
+        logger.exception("score jev failed uid=%s", uid)
+    if jev is not None:
+        content = _jev_score_content(jev)
+        logger.info(
+            "score jev ok uid=%s remaining=%d", uid, credits["remaining"]
+        )
+        return ok_response(content, credits)
+    logger.info("score jev fallback to llm uid=%s", uid)
 
     user_prompt = (
         f"Question: {body.question}\n\n"
@@ -2240,8 +2123,6 @@ async def score_answer(
     try:
         content = await call_with_fallback(payload, TEXT_MODEL, TEXT_FALLBACK_MODEL)
         logger.info("score ok uid=%s remaining=%d", uid, credits["remaining"])
-        if JEV_SCORE_SHADOW_ENABLED:
-            _dispatch_score_shadow(uid, body, content, served_by="llm")
         return ok_response(content, credits)
     except HTTPException as e:
         if e.status_code == 502:
